@@ -1,0 +1,125 @@
+name: Persistent RDP (Auto Restart)
+
+on:
+  workflow_dispatch:
+    inputs:
+      restart:
+        description: "Is this an auto-restart?"
+        required: false
+        default: "false"
+
+jobs:
+  rdp:
+    runs-on: windows-latest
+    timeout-minutes: 355          # Restart a bit before the hard 6h limit
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ========== 1. Enable RDP + Create User ==========
+      - name: Configure RDP
+        shell: pwsh
+        run: |
+          # Enable Remote Desktop
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+
+          # Create a dedicated user (or use runneradmin)
+          $Password = ConvertTo-SecureString "${{ secrets.RDP_PASSWORD }}" -AsPlainText -Force
+          New-LocalUser -Name "rdpuser" -Password $Password -FullName "RDP User" -Description "Persistent RDP User" -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "rdpuser" -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Administrators" -Member "rdpuser" -ErrorAction SilentlyContinue
+
+          Write-Host "RDP User created: rdpuser"
+
+      # ========== 2. Install Tailscale ==========
+      - name: Install & Connect Tailscale
+        shell: pwsh
+        run: |
+          # Install Tailscale
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
+          Invoke-WebRequest -Uri $tsUrl -OutFile "tailscale.msi"
+          Start-Process msiexec.exe -ArgumentList "/i tailscale.msi /quiet" -Wait
+
+          # Connect using auth key
+          & "C:\Program Files\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-rdp-main --accept-routes --accept-dns=false
+
+          Start-Sleep -Seconds 10
+          $ip = & "C:\Program Files\Tailscale\tailscale.exe" ip -4
+          Write-Host "Tailscale IP: $ip"
+
+      # ========== 3. Install rclone + Mount Cloud Drive ==========
+      - name: Setup Persistent Storage (rclone)
+        shell: pwsh
+        run: |
+          # Install rclone
+          Invoke-WebRequest -Uri "https://downloads.rclone.org/rclone-current-windows-amd64.zip" -OutFile "rclone.zip"
+          Expand-Archive rclone.zip -DestinationPath .
+          $rclone = Get-ChildItem -Recurse -Filter rclone.exe | Select-Object -First 1
+
+          # Create rclone config from secret
+          $config = @"
+          ${{ secrets.RCLONE_CONFIG }}
+          "@
+          $config | Out-File -FilePath "$env:APPDATA\rclone\rclone.conf" -Encoding utf8 -Force
+
+          # Mount the remote (example: OneDrive or Google Drive named "persist")
+          # Change "persist:" to your remote name
+          New-Item -ItemType Directory -Force -Path "C:\Persist"
+          Start-Process -FilePath $rclone.FullName -ArgumentList "mount persist: C:\Persist --vfs-cache-mode full --daemon" -WindowStyle Hidden
+
+          Start-Sleep -Seconds 8
+          Write-Host "Cloud drive mounted at C:\Persist"
+
+      # ========== 4. Restore Configurations (Optional) ==========
+      - name: Restore User Configs
+        shell: pwsh
+        run: |
+          if (Test-Path "C:\Persist\configs") {
+            Write-Host "Restoring configurations..."
+            # Example: copy important config folders
+            # Copy-Item "C:\Persist\configs\*" "$env:USERPROFILE\" -Recurse -Force -ErrorAction SilentlyContinue
+          } else {
+            Write-Host "No previous configs found. Creating folder..."
+            New-Item -ItemType Directory -Force -Path "C:\Persist\configs"
+          }
+
+      # ========== 5. Keep Alive + Auto Restart ==========
+      - name: Keep Alive & Auto Restart
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          $startTime = Get-Date
+          $maxMinutes = 340          # Restart after ~5h 40m
+
+          while ($true) {
+            $elapsed = (Get-Date) - $startTime
+            $remaining = $maxMinutes - $elapsed.TotalMinutes
+
+            Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Session running... Remaining: $([math]::Round($remaining,1)) minutes"
+
+            if ($remaining -le 5) {
+              Write-Host "Time almost over. Triggering restart..."
+
+              # Trigger new workflow run
+              $uri = "https://api.github.com/repos/${{ github.repository }}/actions/workflows/rdp-persistent.yml/dispatches"
+              $body = @{
+                ref = "main"
+                inputs = @{
+                  restart = "true"
+                }
+              } | ConvertTo-Json
+
+              Invoke-RestMethod -Uri $uri -Method Post -Headers @{
+                Authorization = "Bearer $env:GH_TOKEN"
+                Accept = "application/vnd.github+json"
+              } -Body $body -ContentType "application/json"
+
+              Write-Host "New session triggered. Exiting current job..."
+              exit 0
+            }
+
+            Start-Sleep -Seconds 60
+          }
